@@ -1,25 +1,10 @@
-"""
-批量化训练水印编码器 - 直接使用预保存Mel版本 + DDP 并行 + 数据增强
-
-修复说明：
-  1. 原版 Pipeline 把 detector 放在 nn.Module 内，导致 DDP 报错。已移出单独包装。
-  2. 修复 Encodec 批处理时因长度一致导致 processor 缺失 `padding_mask` 触发 KeyError 的隐患。
-  3. 修复 Augmenter 内静默跳过报错的问题，加入强显报警。
-  4. 植入 STE (直通估计器)，打通 Encodec/MP3 等不可导攻击的梯度回传。
-
-结构：
-  self.pipeline (DDP)          : WatermarkPipeline(encoder + hift)
-  self.watermark_detector (DDP): Detector
-"""
-
 import argparse
 import csv
 import logging
 import os
 
-# torchrun 会在启动每个子进程时设置 LOCAL_RANK。必须在导入 torch、
-# onnxruntime 等可能初始化 CUDA 的库之前，将该进程隔离到对应物理卡，
-# 否则所有 ONNX Runtime 会话都会默认占用第一张可见卡。
+# Isolate each worker's GPU before importing libraries that initialize CUDA.
+# This keeps ONNX Runtime sessions on the GPU selected by LOCAL_RANK.
 _watermark_gpu_ids = [
     gpu_id.strip()
     for gpu_id in os.environ.get('WATERMARK_GPU_IDS', '').split(',')
@@ -35,12 +20,12 @@ if _watermark_gpu_ids and _local_rank is not None:
         )
     os.environ['CUDA_VISIBLE_DEVICES'] = _watermark_gpu_ids[_local_rank_index]
 
-# ====== 新增：强制优先本地缓存，避免联网超时 ======
-os.environ.pop("HF_ENDPOINT", None)  # 去掉 hf-mirror，避免继续请求镜像
+# Use local model caches in offline mode.
+os.environ.pop("HF_ENDPOINT", None)  # Disable the mirror endpoint.
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-# 你的 EnCodec 本地缓存目录
+# Local EnCodec cache directory.
 ENCODEC_LOCAL_DIR = "/home/zhangyihang/.cache/huggingface/hub/models--facebook--encodec_24khz"
 
 import torch
@@ -85,19 +70,17 @@ import builtins
 _original_print = builtins.print
 
 def _filtered_print(*args, **kwargs):
-    # 将要打印的内容拼成字符串
     text = " ".join(str(arg) for arg in args)
-    # 如果包含这些烦人的关键字，直接默默丢弃，不打印！
+    # Suppress repetitive mel-preprocessing range warnings.
     if "max value is" in text or "min value is" in text:
         return
-    # 否则，正常打印
     _original_print(*args, **kwargs)
 
-# 替换全局的 print 函数
+# Install the print filter.
 builtins.print = _filtered_print
 
 # ============================================================
-# ✅ Pipeline：只含 encoder + hift，不含 detector
+# Pipeline: encoder and vocoder; the detector is wrapped separately.
 # ============================================================
 class WatermarkPipeline(nn.Module):
     def __init__(self, watermark_encoder, hift):
@@ -120,31 +103,9 @@ class WatermarkPipeline(nn.Module):
         return audio_wm, watermarked_mel, mel_feat, watermark_bits
 
 
-# # ============================================================
-# # EnCodec 模型懒加载（新增）
-# # ============================================================
-# _encodec_model     = None
-# _encodec_processor = None
-
-# def _get_encodec(device='cuda'):
-#     """懒加载并缓存 EnCodec 模型与处理器，模型放在指定 device 上。"""
-#     global _encodec_model, _encodec_processor
-#     if _encodec_model is None:
-#         import warnings
-#         from transformers import EncodecModel, AutoProcessor
-#         warnings.filterwarnings(
-#             "ignore",
-#             message=".*Could not find image processor class.*feature_extractor_type.*"
-#         )
-#         _encodec_model     = EncodecModel.from_pretrained("facebook/encodec_24khz")
-#         _encodec_model     = _encodec_model.to(device).eval()
-#         _encodec_processor = AutoProcessor.from_pretrained("facebook/encodec_24khz")
-#         print(f"✓ EnCodec model loaded on {device}")
-#     return _encodec_model, _encodec_processor
 
 # ============================================================
-# EnCodec 模型懒加载
-# 修改：优先从本地 Hugging Face 缓存离线加载，并支持 device 切换
+# Lazy EnCodec loading from the local cache, with device switching.
 # ============================================================
 _encodec_model = None
 _encodec_processor = None
@@ -153,8 +114,7 @@ _encodec_device = None
 
 def _resolve_encodec_local_path() -> str:
     """
-    返回 Hugging Face 缓存中的可直接 from_pretrained 的本地目录。
-    优先使用 snapshots 下的具体快照目录；如果没有，再退回最外层目录。
+    Return a cached snapshot directory, falling back to the cache root.
     """
     base = Path(ENCODEC_LOCAL_DIR)
     if not base.exists():
@@ -177,7 +137,7 @@ def _resolve_encodec_local_path() -> str:
 
 
 def _get_encodec(device='cuda'):
-    """懒加载并缓存 EnCodec 模型与处理器，强制从本地缓存加载。"""
+    """Load and cache EnCodec and its processor from local files."""
     global _encodec_model, _encodec_processor, _encodec_device
 
     if _encodec_model is None:
@@ -213,7 +173,7 @@ def _get_encodec(device='cuda'):
 
 
 # ============================================================
-# ✅ 音频增强器（GPU 批量版）
+# Batched audio augmentation.
 # ============================================================
 class AudioAugmenter:
     def __init__(
@@ -233,7 +193,7 @@ class AudioAugmenter:
         self.max_attacks   = max_attacks
         self.warmup_epochs = warmup_epochs
 
-        # 预加载背景噪声
+        # Preload background noise.
         self._bg_noise = None
         if noise_path is not None:
             try:
@@ -248,7 +208,7 @@ class AudioAugmenter:
                 if rank == 0:
                     print(f"  ⚠️ 背景噪声加载失败: {e}")
 
-        # 攻击池
+        # Build the attack pool.
         self.attack_pool = []
 
         self.attack_pool.append((
@@ -313,7 +273,7 @@ class AudioAugmenter:
             lambda: {'speed_factor': random.choice([0.9, 1.1])},
         ))
 
-        # 按白名单过滤
+        # Filter by the allowed attack names.
         if allowed_attacks is not None:
             allowed_set = set(allowed_attacks)
             self.attack_pool = [(n, f, p) for n, f, p in self.attack_pool if n in allowed_set]
@@ -322,7 +282,7 @@ class AudioAugmenter:
             print(f"✅ AudioAugmenter (GPU加速版): {[n for n, _, _ in self.attack_pool]}")
             print(f"   aug_prob={aug_prob}, max_attacks={max_attacks}, warmup_epochs={warmup_epochs}")
 
-    # ---- GPU 攻击实现 ------------------------------------------------
+    # ---- GPU attack implementations -----------------------------------
 
     @staticmethod
     def _gaussian_noise(audio: torch.Tensor, snr_db: float) -> torch.Tensor:
@@ -399,7 +359,7 @@ class AudioAugmenter:
             cpu     = audio.cpu()
             results = []
             for i in range(cpu.shape[0]):
-                # 💡 修复：加上 .detach()，显式断开计算图
+                # Detach before converting to NumPy.
                 w   = cpu[i].detach().numpy() 
                 s   = convert_float_samples_to_int16(w)
                 seg = pydub.AudioSegment(s.tobytes(), frame_rate=self.sample_rate,
@@ -419,11 +379,10 @@ class AudioAugmenter:
             logging.debug(f"[Augmenter] mp3 failed: {e}")
             return audio
 
-    # ← 新增：encodec 批处理实现
     def _encodec(self, audio: torch.Tensor, device: torch.device,
                  bandwidth: float) -> torch.Tensor:
         """
-        整个 batch [B, T] 一次 encode/decode，返回 [B, T] 在原 device 上。
+        Encode and decode a [B, T] batch, returning it on the original device.
         """
         model_ec, processor_ec = _get_encodec(device=str(device))
         orig_len   = audio.shape[-1]
@@ -431,7 +390,7 @@ class AudioAugmenter:
 
         audio_cpu      = audio.cpu().float()
         
-        # 💡 修复：加上 .detach()，安全地转为 numpy
+        # Detach before converting to NumPy.
         raw_audio_list = [audio_cpu[i].detach().numpy() for i in range(batch_size)]
 
         inputs = processor_ec(
@@ -440,7 +399,7 @@ class AudioAugmenter:
             return_tensors="pt"
         ).to(device)
 
-        # 安全提取 padding_mask
+        # The processor may omit padding_mask.
         pad_mask = inputs.get("padding_mask", None)
 
         with torch.no_grad():
@@ -457,7 +416,7 @@ class AudioAugmenter:
 
         out = audio_values.squeeze(1)  # [B, T']
 
-        # 对齐长度
+        # Restore the original length.
         if out.shape[-1] < orig_len:
             out = F.pad(out, (0, orig_len - out.shape[-1]))
         else:
@@ -481,7 +440,7 @@ class AudioAugmenter:
             results.append(stretched)
         return torch.stack(results).to(device)
 
-    # ---- 对外接口 ----------------------------------------------------
+    # ---- Augmentation entry point -------------------------------------
 
     def __call__(self, audio_batch: torch.Tensor, epoch: int = 999) -> torch.Tensor:
         if epoch <= self.warmup_epochs:
@@ -502,20 +461,20 @@ class AudioAugmenter:
             try:
                 kwargs = param_fn()
                 if name == 'encodec':
-                    # encodec 单独走批处理分支，不用 batch_fn
+                    # EnCodec uses its dedicated batch implementation.
                     augmented = self._encodec(result, device, **kwargs)
                 else:
                     augmented = batch_fn(result, device, **kwargs)
 
                 # =======================================================
-                # 💡 核心修复 2：STE (直通估计器) 
+                # Use a straight-through estimator for non-differentiable attacks.
                 # =======================================================
                 if name in ['encodec', 'mp3', 'quantization','time_stretch'] or not augmented.requires_grad:
                     augmented = result + (augmented - result).detach()
 
                 result = torch.where(mask.unsqueeze(-1), augmented, result)
             except Exception as e:
-                # 💡 核心修复 3：拆掉静音报错器，强制打印所有异常
+                # Report augmentation failures.
                 print(f"\n🚨🚨🚨 [Augmenter 致命报错] 攻击 '{name}' 失败！原因: {e} 🚨🚨🚨\n")
                 import logging
                 logging.error(f"[Augmenter] {name} failed: {e}, skipping")
@@ -527,7 +486,7 @@ class AudioAugmenter:
 
 
 # ============================================================
-# 工具函数
+# Utility functions.
 # ============================================================
 def seed_everything(seed=42):
     random.seed(seed)
@@ -545,7 +504,7 @@ def generate_random_watermark(batch_size, watermark_length=32):
 
 
 # ============================================================
-# 参数解析
+# Command-line arguments.
 # ============================================================
 def get_args():
     parser = argparse.ArgumentParser(description='Train Watermark (DDP + Aug, detector separated)')
@@ -580,13 +539,12 @@ def get_args():
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--resume_path', type=str, default=None)
 
-    # 在 --resume_path 那行后面加
     parser.add_argument('--resume_lr', type=float, default=None)
     parser.add_argument('--resume_epoch', type=int, default=0)
 
     parser.add_argument('--gpu_ids', type=str, default='0,1,2,3')
     parser.add_argument('--master_port', type=str, default='29500')
-    # 数据增强
+    # Data augmentation.
     parser.add_argument('--aug_prob', type=float, default=0.8)
     parser.add_argument('--aug_max_attacks', type=int, default=2)
     parser.add_argument('--aug_warmup_epochs', type=int, default=5)
@@ -657,14 +615,14 @@ def collate_fn_mel_batch(batch):
 
 
 # ============================================================
-# Trainer（与原版完全一致，无改动）
+# Trainer.
 # ============================================================
 class WatermarkTrainer:
     def __init__(self, args, rank, world_size):
         self.args       = args
         self.rank       = rank
         self.world_size = world_size
-        # worker_fn为每个进程仅暴露一张物理GPU，因此进程内统一使用cuda:0。
+        # Each worker exposes one physical GPU as cuda:0.
         self.device     = torch.device('cuda:0')
         torch.cuda.set_device(0)
 
@@ -820,9 +778,7 @@ class WatermarkTrainer:
             weight_decay=1e-4,
         )
 
-        # ↓↓↓ 新增：resume时恢复optimizer状态并冻结LR ↓↓↓
         if self.args.resume and self.args.resume_path:
-            # 预实验
             self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer, T_max=self.args.num_epochs, eta_min=1e-6
             )
@@ -836,15 +792,13 @@ class WatermarkTrainer:
             #     pg['lr'] = resume_lr
             # if self.rank == 0:
             #     logging.info(f"✓ LR locked at {resume_lr}")
-            # # 冻结LR，不再衰减
+            # Constant-learning-rate alternative.
             # self.scheduler = optim.lr_scheduler.ConstantLR(
             #     self.optimizer, factor=1.0, total_iters=99999
             # )
         else:
-            # 预实验
             self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer, T_max=self.args.num_epochs, eta_min=1e-6
-                # 之前一直是1e-6,transformerdecoder 4e-6,cross 5e-6
             )
 
     # ----------------------------------------------------------
@@ -931,19 +885,19 @@ class WatermarkTrainer:
                 mel_feat, watermark_bits, use_bit_inverse=True
             )
 
-            # ---- Step 2: 随机音频攻击（encodec 逻辑已在 augmenter 内）----
+            # ---- Step 2: apply random audio attacks -------------------
             audio_wm_aug = self.augmenter(audio_wm, epoch=epoch)
 
-            # ---- Step 3: 增强音频 → detector ----
+            # ---- Step 3: extract bits from augmented audio ------------
             detected_bits = self.watermark_detector(audio_wm_aug)
 
-            # ---- 逐位精度统计 ----
+            # ---- Per-bit accuracy -------------------------------------
             with torch.no_grad():
                 pred = (detected_bits >= 0.5).float()
                 per_bit_correct += (pred == wm_bits_doubled.float()).float().sum(dim=0)
                 per_bit_total   += wm_bits_doubled.shape[0]
 
-            # ---- 损失 ----
+            # ---- Loss -------------------------------------------------
             loss_dict = self.criterion(
                 detected_bits=detected_bits,
                 target_bits=wm_bits_doubled,
@@ -958,7 +912,7 @@ class WatermarkTrainer:
                 print(f"Loss:{loss.item():.4f} BER:{loss_dict['ber']:.4f} "
                       f"d:{loss_dict['decode_loss']:.4f} a:{loss_dict['audio_loss']:.4f}")
 
-            # ---- 反向传播 ----
+            # ---- Backpropagation --------------------------------------
             self.optimizer.zero_grad()
             loss.backward()
 
@@ -1005,7 +959,7 @@ class WatermarkTrainer:
 
             self.global_step += 1
 
-            # 第一个epoch内按固定间隔评估CV集，只统计跨卡汇总的ACC。
+            # Validate periodically in the first epoch and aggregate ACC across ranks.
             step_in_epoch = batch_idx + 1
             if (epoch == 1 and val_loader is not None and
                     self.args.validate_step > 0 and
@@ -1033,7 +987,7 @@ class WatermarkTrainer:
                     self._append_step_validation(
                         epoch, step_in_epoch, self.global_step, val_metrics)
 
-        # ---- 跨卡汇总 ----
+        # ---- Aggregate across ranks -----------------------------------
         dist.all_reduce(per_bit_correct, op=dist.ReduceOp.SUM)
         dist.all_reduce(per_bit_total,   op=dist.ReduceOp.SUM)
 
@@ -1062,13 +1016,13 @@ class WatermarkTrainer:
         pipeline_was_training = self.pipeline.training
         detector_was_training = self.watermark_detector.training
 
-        # 验证不应消耗训练使用的随机数；HiFT可能包含随机相位/噪声生成。
+        # Preserve training RNG states during stochastic vocoder validation.
         cpu_rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state(self.device)
         python_rng_state = random.getstate()
         numpy_rng_state = np.random.get_state()
 
-        # 每次step验证都从相同RNG状态开始，使HiFT的随机生成可比较。
+        # Use the same RNG state for comparable validation outputs.
         validation_seed = 20260801 + self.rank
         torch.manual_seed(validation_seed)
         torch.cuda.manual_seed(validation_seed)
@@ -1080,8 +1034,7 @@ class WatermarkTrainer:
         per_bit_total = torch.zeros(
             self.args.watermark_dim, dtype=torch.float64, device=self.device)
 
-        # 独立generator保证每次step验证及各消融版本使用相同的验证水印，
-        # 同时不改变训练的全局CPU RNG状态。
+        # Use identical validation watermarks without consuming the global CPU RNG.
         watermark_generator = torch.Generator(device='cpu')
         watermark_generator.manual_seed(validation_seed)
 
@@ -1153,7 +1106,7 @@ class WatermarkTrainer:
     # ----------------------------------------------------------
     def _append_step_validation(
             self, epoch, step_in_epoch, global_step, metrics):
-        """在rank 0上增量保存step验证ACC，便于后续直接绘图。"""
+        """Append step-validation ACC on rank zero for plotting."""
         if self.rank != 0:
             return
         output_path = os.path.join(
@@ -1213,7 +1166,7 @@ class WatermarkTrainer:
                 val_metrics = self.validate(val_loader)
                 if self.rank == 0:
                     logging.info(f"Val ACC (clean): {val_metrics['acc']:.6f}")
-                    # 若epoch末尾不是validate_step的整数倍，额外保存终点结果。
+                    # Save the epoch endpoint if it is not a scheduled validation step.
                     if (epoch == 1 and self.args.validate_step > 0 and
                             len(train_loader) % self.args.validate_step != 0):
                         self._append_step_validation(
@@ -1230,10 +1183,10 @@ class WatermarkTrainer:
 
 
 # ============================================================
-# DDP Worker 入口
+# DDP worker entry point.
 # ============================================================
 def worker_fn(args):
-    # torchrun 自动设置 LOCAL_RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT
+    # torchrun sets LOCAL_RANK, WORLD_SIZE, MASTER_ADDR, and MASTER_PORT.
     rank       = int(os.environ['LOCAL_RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
     physical_gpu_ids = [
@@ -1309,7 +1262,7 @@ def worker_fn(args):
 
 
 # ============================================================
-# 主入口
+# Main entry point.
 # ============================================================
 def main():
     args = get_args()
